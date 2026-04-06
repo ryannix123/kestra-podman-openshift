@@ -1,0 +1,316 @@
+---
+# PostgreSQL PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgresql-pvc
+  namespace: ryan-nix-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi
+
+---
+# PostgreSQL ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgresql-config
+  namespace: ryan-nix-dev
+data:
+  POSTGRES_DB: kestra
+  POSTGRES_USER: kestra
+  PGUSER: kestra
+
+---
+# PostgreSQL Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgresql-secret
+  namespace: ryan-nix-dev
+type: Opaque
+data:
+  POSTGRES_PASSWORD: azNzdHI0  # base64 encoded "k3str4"
+
+---
+# PostgreSQL Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgresql
+  namespace: ryan-nix-dev
+  labels:
+    app: postgresql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1013790000
+        fsGroup: 1013790000
+      containers:
+      - name: postgresql
+        image: registry.redhat.io/rhel8/postgresql-13:latest
+        ports:
+        - containerPort: 5432
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1013790000
+          capabilities:
+            drop:
+              - ALL
+        env:
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: postgresql-config
+              key: POSTGRES_DB
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: postgresql-config
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgresql-secret
+              key: POSTGRES_PASSWORD
+        - name: PGUSER
+          valueFrom:
+            configMapKeyRef:
+              name: postgresql-config
+              key: PGUSER
+        volumeMounts:
+        - name: postgresql-storage
+          mountPath: /var/lib/pgsql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        readinessProbe:
+          exec:
+            command:
+              - /usr/libexec/check-container
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+          periodSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command:
+              - /usr/libexec/check-container
+              - --live
+          initialDelaySeconds: 120
+          timeoutSeconds: 10
+          periodSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+      volumes:
+      - name: postgresql-storage
+        persistentVolumeClaim:
+          claimName: postgresql-pvc
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: ryan-nix-dev
+  labels:
+    app: postgresql
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: postgresql
+
+---
+# Kestra ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kestra-config
+  namespace: ryan-nix-dev
+data:
+  application.yml: |
+    datasources:
+      postgres:
+        url: jdbc:postgresql://postgresql:5432/kestra
+        username: kestra
+        password: k3str4
+        driverClassName: org.postgresql.Driver
+    kestra:
+      repository:
+        type: postgres
+      queue:
+        type: postgres
+      storage:
+        type: local
+        local:
+          base-path: "/app/storage"
+      server:
+        basic-auth:
+          enabled: false
+      metrics:
+        enabled: true
+
+---
+# Kestra PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kestra-storage-pvc
+  namespace: ryan-nix-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# Kestra Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kestra
+  namespace: ryan-nix-dev
+  labels:
+    app: kestra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kestra
+  template:
+    metadata:
+      labels:
+        app: kestra
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1013790000
+        fsGroup: 1013790000
+      initContainers:
+      - name: wait-for-postgres
+        image: registry.redhat.io/ubi8/ubi-minimal:latest
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1013790000
+          capabilities:
+            drop:
+              - ALL
+        command:
+        - /bin/bash
+        - -c
+        - |
+          until nc -z postgresql 5432; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          echo "PostgreSQL is ready!"
+      containers:
+      - name: kestra
+        image: kestra/kestra:latest
+        ports:
+        - containerPort: 8080
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1013790000
+          capabilities:
+            drop:
+              - ALL
+        env:
+        - name: KESTRA_CONFIGURATION
+          value: /app/config/application.yml
+        volumeMounts:
+        - name: kestra-config
+          mountPath: /app/config
+        - name: kestra-storage
+          mountPath: /app/storage
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+      volumes:
+      - name: kestra-config
+        configMap:
+          name: kestra-config
+      - name: kestra-storage
+        persistentVolumeClaim:
+          claimName: kestra-storage-pvc
+
+---
+# Kestra Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: kestra
+  namespace: ryan-nix-dev
+  labels:
+    app: kestra
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  selector:
+    app: kestra
+
+---
+# Kestra Route (OpenShift specific)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: kestra
+  namespace: ryan-nix-dev
+  labels:
+    app: kestra
+spec:
+  to:
+    kind: Service
+    name: kestra
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

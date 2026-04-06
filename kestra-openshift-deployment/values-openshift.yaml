@@ -1,19 +1,70 @@
-securityContext:
-  runAsNonRoot: true
-  runAsUser: 1008630000
-  fsGroup: 1008630000
-  allowPrivilegeEscalation: false
+# ─── Application Configuration ─────────────────────────────────────────────────
+configurations:
+  application:
+    datasources:
+      postgres:
+        url: jdbc:postgresql://kestra-postgresql:5432/kestra
+        username: kestra
+        password: k3str4
+        driverClassName: org.postgresql.Driver
+    kestra:
+      repository:
+        type: postgres
+      queue:
+        type: postgres
+      storage:
+        type: local
+        local:
+          base-path: "/tmp/kestra-storage"
 
+# ─── Common ────────────────────────────────────────────────────────────────────
+common:
+  startupProbe:
+    httpGet:
+      path: /health
+      port: 8081        # management port
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    failureThreshold: 60
+
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8081        # management port
+    initialDelaySeconds: 120
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8081        # management port
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 5
+
+  initContainers:
+    - name: wait-for-postgres
+      image: registry.redhat.io/ubi8/ubi-minimal:latest
+      command:
+        - /bin/bash
+        - -c
+        - |
+          until bash -c 'echo > /dev/tcp/kestra-postgresql/5432' 2>/dev/null; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          echo "PostgreSQL is ready!"
+
+# ─── Disable built-ins ─────────────────────────────────────────────────────────
 postgresql:
-  auth:
-    username: kestra
-    password: k3str4
-    database: kestra
-  primary:
-    securityContext:
-      runAsNonRoot: true
-      runAsUser: 1008630000
-      fsGroup: 1008630000
-      allowPrivilegeEscalation: false
+  enabled: false
+
 dind:
-  enabled: false  # Disable Docker-in-Docker if not required
+  enabled: false
+
+# ─── Disable ingress - we expose via oc expose ─────────────────────────────────
+ingress:
+  enabled: false
