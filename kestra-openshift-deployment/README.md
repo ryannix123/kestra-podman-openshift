@@ -51,20 +51,17 @@ The included `deploy-kestra.yml` playbook handles the full lifecycle including P
 ansible-galaxy collection install kubernetes.core
 pip install kubernetes openshift
 
-# Deploy
-ansible-playbook deploy-kestra.yml \
-  -e namespace=ryan-nix-dev \
-  -e kestra_db_password=k3str4
+# Deploy — namespace autodetected from current oc project
+ansible-playbook deploy-kestra.yml -e kestra_db_password=k3str4
+
+# Deploy to a specific namespace
+ansible-playbook deploy-kestra.yml -e kestra_ns=ryan-nix-dev -e kestra_db_password=k3str4
 
 # Uninstall — removes all resources but KEEPS PVCs and data
-ansible-playbook deploy-kestra.yml \
-  -e namespace=ryan-nix-dev \
-  -e action=uninstall
+ansible-playbook deploy-kestra.yml -e kestra_action=uninstall
 
 # Destroy — removes everything including PVCs (DATA WILL BE LOST)
-ansible-playbook deploy-kestra.yml \
-  -e namespace=ryan-nix-dev \
-  -e action=destroy
+ansible-playbook deploy-kestra.yml -e kestra_action=destroy
 ```
 
 ---
