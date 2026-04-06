@@ -1,33 +1,58 @@
 ---
 # deploy-kestra.yml
 #
-# Deploys Kestra workflow engine on OpenShift using Helm.
+# Deploys or removes Kestra workflow engine on OpenShift using Helm.
 # Tested on: Red Hat OpenShift Developer Sandbox (ROSA)
 #
 # Usage:
-#   ansible-playbook deploy-kestra.yml \
-#     -e namespace=ryan-nix-dev \
-#     -e kestra_db_password=k3str4
+#   Deploy:
+#     ansible-playbook deploy-kestra.yml \
+#       -e namespace=ryan-nix-dev \
+#       -e kestra_db_password=k3str4
+#
+#   Uninstall (removes Helm release, postgres, route — KEEPS PVCs/data):
+#     ansible-playbook deploy-kestra.yml \
+#       -e namespace=ryan-nix-dev \
+#       -e action=uninstall
+#
+#   Full teardown (removes everything including PVCs — DATA WILL BE LOST):
+#     ansible-playbook deploy-kestra.yml \
+#       -e namespace=ryan-nix-dev \
+#       -e action=destroy
 #
 # Requirements:
 #   ansible-galaxy collection install kubernetes.core
 #   pip install kubernetes openshift
 #   oc login (or set KUBECONFIG)
 
-- name: Deploy Kestra on OpenShift
+- name: Manage Kestra on OpenShift
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
+    # ── Core settings ─────────────────────────────────────────────────────────
     namespace: ryan-nix-dev
+    action: deploy                    # deploy | uninstall | destroy
     kestra_version: "latest"
     kestra_db_password: "k3str4"
     kestra_db_user: "kestra"
     kestra_db_name: "kestra"
     kestra_db_service: "kestra-postgresql"
     kestra_route_name: "kestra-route"
+
+    # ── Images ────────────────────────────────────────────────────────────────
     postgresql_image: "registry.redhat.io/rhel9/postgresql-16:latest"
+    kestra_image: "kestra/kestra:{{ kestra_version }}"
+
+    # ── Storage ───────────────────────────────────────────────────────────────
+    kestra_storage_pvc_name: "kestra-storage"
+    kestra_storage_pvc_size: "10Gi"
+    kestra_pg_pvc_name: "kestra-pg-data"
+    kestra_pg_pvc_size: "5Gi"
+    kestra_storage_mount_path: "/app/kestra-storage"
+
+    # ── Helm ──────────────────────────────────────────────────────────────────
     helm_release_name: "kestra"
     helm_repo_name: "kestra"
     helm_repo_url: "https://helm.kestra.io/"
@@ -35,7 +60,7 @@
 
   tasks:
 
-    # ── Preflight ────────────────────────────────────────────────────────────────
+    # ── Preflight ─────────────────────────────────────────────────────────────
 
     - name: Verify oc is authenticated
       ansible.builtin.command: oc whoami
@@ -43,9 +68,9 @@
       changed_when: false
       failed_when: oc_whoami.rc != 0
 
-    - name: Show current user
+    - name: Show current user and action
       ansible.builtin.debug:
-        msg: "Deploying as: {{ oc_whoami.stdout }}"
+        msg: "Running action '{{ action }}' as {{ oc_whoami.stdout }} in namespace {{ namespace }}"
 
     - name: Verify target namespace exists
       kubernetes.core.k8s_info:
@@ -55,7 +80,104 @@
       register: ns_check
       failed_when: ns_check.resources | length == 0
 
-    # ── Helm repo ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # UNINSTALL — remove Helm release, postgres, route but KEEP PVCs
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: UNINSTALL — Remove Helm release
+      when: action in ['uninstall', 'destroy']
+      kubernetes.core.helm:
+        name: "{{ helm_release_name }}"
+        release_namespace: "{{ namespace }}"
+        state: absent
+      ignore_errors: true
+
+    - name: UNINSTALL — Remove PostgreSQL deployment
+      when: action in ['uninstall', 'destroy']
+      kubernetes.core.k8s:
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ kestra_db_service }}"
+        namespace: "{{ namespace }}"
+        state: absent
+      ignore_errors: true
+
+    - name: UNINSTALL — Remove PostgreSQL service
+      when: action in ['uninstall', 'destroy']
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: Service
+        name: "{{ kestra_db_service }}"
+        namespace: "{{ namespace }}"
+        state: absent
+      ignore_errors: true
+
+    - name: UNINSTALL — Remove OpenShift Route
+      when: action in ['uninstall', 'destroy']
+      kubernetes.core.k8s:
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: "{{ kestra_route_name }}"
+        namespace: "{{ namespace }}"
+        state: absent
+      ignore_errors: true
+
+    - name: UNINSTALL — Remove generated values file
+      when: action in ['uninstall', 'destroy']
+      ansible.builtin.file:
+        path: "{{ values_file }}"
+        state: absent
+      ignore_errors: true
+
+    - name: UNINSTALL — Summary
+      when: action == 'uninstall'
+      ansible.builtin.debug:
+        msg: |
+          ✅ Kestra uninstalled. PVCs have been retained:
+             - {{ kestra_pg_pvc_name }} (PostgreSQL data)
+             - {{ kestra_storage_pvc_name }} (Kestra storage)
+
+          Re-deploy at any time with:
+            ansible-playbook deploy-kestra.yml -e namespace={{ namespace }}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DESTROY — additionally remove PVCs (DATA WILL BE LOST)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: DESTROY — Remove Kestra storage PVC
+      when: action == 'destroy'
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ kestra_storage_pvc_name }}"
+        namespace: "{{ namespace }}"
+        state: absent
+      ignore_errors: true
+
+    - name: DESTROY — Remove PostgreSQL data PVC
+      when: action == 'destroy'
+      kubernetes.core.k8s:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: "{{ kestra_pg_pvc_name }}"
+        namespace: "{{ namespace }}"
+        state: absent
+      ignore_errors: true
+
+    - name: DESTROY — Summary
+      when: action == 'destroy'
+      ansible.builtin.debug:
+        msg: "💥 Full teardown complete. All Kestra resources and data removed from {{ namespace }}."
+
+    - name: End play for uninstall/destroy actions
+      when: action in ['uninstall', 'destroy']
+      ansible.builtin.meta: end_play
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # DEPLOY
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Helm repo ─────────────────────────────────────────────────────────────
 
     - name: Add Kestra Helm repository
       kubernetes.core.helm_repository:
@@ -66,7 +188,57 @@
       ansible.builtin.command: helm repo update
       changed_when: false
 
-    # ── PostgreSQL 16 ────────────────────────────────────────────────────────────
+    # ── PVCs ──────────────────────────────────────────────────────────────────
+
+    - name: Create PostgreSQL data PVC
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ kestra_pg_pvc_name }}"
+            namespace: "{{ namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: "{{ kestra_pg_pvc_size }}"
+
+    - name: Create Kestra storage PVC
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: "{{ kestra_storage_pvc_name }}"
+            namespace: "{{ namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: "{{ kestra_storage_pvc_size }}"
+
+    - name: Confirm PVCs are bound or pending
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ namespace }}"
+        name: "{{ item }}"
+      register: pvc_status
+      retries: 12
+      delay: 5
+      until: >
+        pvc_status.resources | length > 0 and
+        pvc_status.resources[0].status.phase in ['Bound', 'Pending']
+      loop:
+        - "{{ kestra_pg_pvc_name }}"
+        - "{{ kestra_storage_pvc_name }}"
+
+    # ── PostgreSQL 16 ─────────────────────────────────────────────────────────
 
     - name: Check if PostgreSQL is already deployed
       kubernetes.core.k8s_info:
@@ -88,11 +260,24 @@
       register: pg_deploy
       changed_when: pg_deploy.rc == 0
 
+    - name: Attach PVC to PostgreSQL deployment
+      ansible.builtin.command: >
+        oc set volume deployment/{{ kestra_db_service }}
+        --add
+        --name={{ kestra_pg_pvc_name }}
+        --type=persistentVolumeClaim
+        --claim-name={{ kestra_pg_pvc_name }}
+        --mount-path=/var/lib/pgsql/data
+        --overwrite
+        -n {{ namespace }}
+      register: pvc_attach
+      changed_when: pvc_attach.rc == 0
+
     - name: Wait for PostgreSQL rollout
       ansible.builtin.command: >
         oc rollout status deployment/{{ kestra_db_service }}
         -n {{ namespace }}
-        --timeout=120s
+        --timeout=180s
       changed_when: false
 
     - name: Confirm PostgreSQL is accepting connections
@@ -101,12 +286,12 @@
         -n {{ namespace }}
         -- pg_isready -U {{ kestra_db_user }} -d {{ kestra_db_name }}
       register: pg_ready
-      retries: 10
+      retries: 12
       delay: 5
       until: pg_ready.rc == 0
       changed_when: false
 
-    # ── values-openshift.yaml ────────────────────────────────────────────────────
+    # ── values-openshift.yaml ─────────────────────────────────────────────────
 
     - name: Template values-openshift.yaml
       ansible.builtin.copy:
@@ -130,7 +315,7 @@
                 storage:
                   type: local
                   local:
-                    base-path: "/tmp/kestra-storage"
+                    base-path: "{{ kestra_storage_mount_path }}"
 
           common:
             podSecurityContext: {}
@@ -173,7 +358,7 @@
 
             initContainers:
               - name: wait-for-postgres
-                image: kestra/kestra:{{ kestra_version }}
+                image: {{ kestra_image }}
                 command:
                   - /bin/bash
                   - -c
@@ -184,6 +369,15 @@
                     done
                     echo "PostgreSQL is ready!"
 
+            extraVolumes:
+              - name: kestra-storage
+                persistentVolumeClaim:
+                  claimName: {{ kestra_storage_pvc_name }}
+
+            extraVolumeMounts:
+              - name: kestra-storage
+                mountPath: {{ kestra_storage_mount_path }}
+
           postgresql:
             enabled: false
 
@@ -193,7 +387,7 @@
           ingress:
             enabled: false
 
-    # ── Helm install/upgrade ─────────────────────────────────────────────────────
+    # ── Helm install/upgrade ──────────────────────────────────────────────────
 
     - name: Check if Kestra Helm release exists
       ansible.builtin.command: >
@@ -222,7 +416,7 @@
           - "{{ values_file }}"
         wait: false
 
-    # ── Wait for Kestra pod ──────────────────────────────────────────────────────
+    # ── Wait for Kestra ───────────────────────────────────────────────────────
 
     - name: Wait for Kestra standalone pod to exist
       kubernetes.core.k8s_info:
@@ -232,7 +426,7 @@
         label_selectors:
           - app.kubernetes.io/component=standalone
       register: kestra_pods
-      retries: 20
+      retries: 24
       delay: 5
       until: kestra_pods.resources | length > 0
 
@@ -248,7 +442,7 @@
           status: "True"
         wait_timeout: 300
 
-    # ── OpenShift Route ──────────────────────────────────────────────────────────
+    # ── OpenShift Route ───────────────────────────────────────────────────────
 
     - name: Check if route already exists
       kubernetes.core.k8s_info:
@@ -280,7 +474,7 @@
               termination: edge
               insecureEdgeTerminationPolicy: Redirect
 
-    - name: Get Kestra route URL
+    - name: Get Kestra route
       kubernetes.core.k8s_info:
         api_version: route.openshift.io/v1
         kind: Route
@@ -288,6 +482,19 @@
         namespace: "{{ namespace }}"
       register: kestra_route
 
-    - name: Print Kestra URL
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    - name: Deployment summary
       ansible.builtin.debug:
-        msg: "✅ Kestra is available at: https://{{ kestra_route.resources[0].spec.host }}"
+        msg: |
+          ✅ Kestra deployed successfully!
+
+          🌐 UI:        https://{{ kestra_route.resources[0].spec.host }}
+          🗄️  Database:  {{ kestra_db_service }} (PVC: {{ kestra_pg_pvc_name }}, {{ kestra_pg_pvc_size }})
+          💾 Storage:   {{ kestra_storage_mount_path }} (PVC: {{ kestra_storage_pvc_name }}, {{ kestra_storage_pvc_size }})
+
+          Uninstall (keep data):
+            ansible-playbook deploy-kestra.yml -e namespace={{ namespace }} -e action=uninstall
+
+          Full teardown (delete everything including data):
+            ansible-playbook deploy-kestra.yml -e namespace={{ namespace }} -e action=destroy

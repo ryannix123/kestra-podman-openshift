@@ -1,3 +1,29 @@
+# values-openshift.yaml
+# Kestra on OpenShift — Helm chart v1.0+
+# Generated/managed by deploy-kestra.yml
+# For manual installs, ensure PVCs exist first:
+#   oc apply -f - <<EOF
+#   apiVersion: v1
+#   kind: PersistentVolumeClaim
+#   metadata:
+#     name: kestra-pg-data
+#   spec:
+#     accessModes: [ReadWriteOnce]
+#     resources:
+#       requests:
+#         storage: 5Gi
+#   ---
+#   apiVersion: v1
+#   kind: PersistentVolumeClaim
+#   metadata:
+#     name: kestra-storage
+#   spec:
+#     accessModes: [ReadWriteOnce]
+#     resources:
+#       requests:
+#         storage: 10Gi
+#   EOF
+
 # ─── Application Configuration ─────────────────────────────────────────────────
 configurations:
   application:
@@ -15,22 +41,36 @@ configurations:
       storage:
         type: local
         local:
-          base-path: "/tmp/kestra-storage"
+          base-path: "/app/kestra-storage"   # PVC-backed — not /tmp
 
-# ─── Common ────────────────────────────────────────────────────────────────────
+# ─── Common (applies to all Kestra components) ─────────────────────────────────
 common:
+  # Do NOT set runAsUser or fsGroup — OpenShift assigns per namespace
+  podSecurityContext: {}
+  securityContext:
+    allowPrivilegeEscalation: false
+
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+  # Health is on the MANAGEMENT port (8081), NOT the app port (8080)
   startupProbe:
     httpGet:
       path: /health
-      port: 8081        # management port
+      port: 8081
     initialDelaySeconds: 10
     periodSeconds: 5
-    failureThreshold: 60
+    failureThreshold: 60      # 5 min window — Kestra scans 1000+ plugins on boot
 
   livenessProbe:
     httpGet:
       path: /health
-      port: 8081        # management port
+      port: 8081
     initialDelaySeconds: 120
     periodSeconds: 30
     timeoutSeconds: 10
@@ -39,15 +79,17 @@ common:
   readinessProbe:
     httpGet:
       path: /health
-      port: 8081        # management port
+      port: 8081
     initialDelaySeconds: 60
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 5
 
+  # Reuse the Kestra image — avoids extra registry pull
+  # Uses bash /dev/tcp because ubi-minimal does not include netcat
   initContainers:
     - name: wait-for-postgres
-      image: registry.redhat.io/ubi8/ubi-minimal:latest
+      image: kestra/kestra:latest
       command:
         - /bin/bash
         - -c
@@ -58,13 +100,23 @@ common:
           done
           echo "PostgreSQL is ready!"
 
-# ─── Disable built-ins ─────────────────────────────────────────────────────────
+  # PVC-backed storage for Kestra files, outputs, and task artifacts
+  extraVolumes:
+    - name: kestra-storage
+      persistentVolumeClaim:
+        claimName: kestra-storage
+
+  extraVolumeMounts:
+    - name: kestra-storage
+      mountPath: /app/kestra-storage
+
+# ─── Disable built-in dependencies ────────────────────────────────────────────
 postgresql:
   enabled: false
 
 dind:
   enabled: false
 
-# ─── Disable ingress - we expose via oc expose ─────────────────────────────────
+# ─── Route is created via oc expose (see README) ──────────────────────────────
 ingress:
   enabled: false

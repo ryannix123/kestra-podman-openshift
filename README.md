@@ -6,6 +6,7 @@
   <img alt="Kestra version" src="https://img.shields.io/badge/kestra-latest-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyeiIvPjwvc3ZnPg=="/>
   <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white"/>
   <img alt="Podman" src="https://img.shields.io/badge/Podman-compatible-892CA0?logo=podman&logoColor=white"/>
+  <img alt="Helm CLI" src="https://img.shields.io/badge/Helm%20CLI-v4.x-0F1689?logo=helm&logoColor=white"/>
   <img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue"/>
 </p>
 
