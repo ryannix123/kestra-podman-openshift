@@ -4,8 +4,7 @@
 
 <p align="center">
   <img alt="Kestra version" src="https://img.shields.io/badge/kestra-1.3.7+-blueviolet"/>
-  <img alt="Kestra Helm Chart" src="https://img.shields.io/badge/kestra%20chart-v1.0+-blueviolet"/>
-  <img alt="Helm CLI" src="https://img.shields.io/badge/Helm%20CLI-v4.x-0F1689?logo=helm&logoColor=white"/>
+  <img alt="Helm chart" src="https://img.shields.io/badge/helm-v1.0+-blue?logo=helm&logoColor=white"/>
   <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white"/>
   <img alt="OpenShift" src="https://img.shields.io/badge/OpenShift-4.x-EE0000?logo=redhatopenshift&logoColor=white"/>
   <img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue"/>
@@ -14,6 +13,27 @@
 # 🚀 Deploying Kestra on OpenShift (Developer Sandbox)
 
 This guide documents a battle-tested deployment of [Kestra](https://kestra.io) on the Red Hat OpenShift Developer Sandbox using Helm. It captures every real-world issue encountered — SCC restrictions, PostgreSQL version compatibility, Helm v1.0 schema changes, and probe port mismatches — so you don't have to debug them yourself.
+
+The [Red Hat Developer Sandbox](https://developers.redhat.com/developer-sandbox) is a **free** OpenShift environment perfect for testing Kestra:
+
+- **Free tier** — No credit card required
+- **Generous resources** — 14 GB RAM, 40 GB storage, 3 CPU cores
+- **Latest OpenShift** — Always running a recent version (4.21+)
+- **Auto-hibernation** — Deployments scale to zero after 12 hours of inactivity
+
+### Waking Up Your Deployment
+
+When you return after the sandbox has hibernated, your pods will be scaled down. Run this command to bring everything back up:
+
+```bash
+# Scale all deployments back to 1 replica
+oc scale deployment --all --replicas=1
+
+# Or specify your namespace explicitly
+oc scale deployment --all --replicas=1 -n $(oc project -q)
+```
+
+Your data persists in the PVCs — only the pods are stopped during hibernation.
 
 > 🐳 **Running locally with Podman?** See the [Podman deployment guide](../README.md).
 
@@ -30,38 +50,33 @@ This guide documents a battle-tested deployment of [Kestra](https://kestra.io) o
 
 ## ⚠️ Key Lessons Learned (Read First)
 
+Before diving in, these are the non-obvious gotchas this guide resolves:
+
 | Issue | Root Cause | Fix |
 |---|---|---|
 | `configuration is not authorized anymore` | Kestra Helm chart v1.0 broke the old `configuration:` key | Use `configurations.application:` instead |
 | Pods never created (SCC error) | Hardcoded `runAsUser`/`fsGroup` outside the namespace UID range | Remove all hardcoded UIDs — let OpenShift assign them |
 | Flyway migration fails (`syntax error at RETURN`) | PostgreSQL 10 (from `oc new-app postgresql-persistent`) is too old | Deploy PostgreSQL **16** explicitly |
-| Pod restarts every 60–90s | Probes hitting port 8080 — health is on **8081** | Set all probes to port `8081` |
-| `AccessDeniedException: /app/storage` | Container UID has no write access to `/app/storage` | Mount a PVC at `/app/kestra-storage` |
-| `nc` not found in init container | `ubi8/ubi-minimal` does not include netcat | Use bash `/dev/tcp` + reuse the Kestra image |
-| Rolling update deadlocked | Old pod never becomes Ready, Kubernetes won't terminate it | Force-delete the old pod |
+| Pod restarts every 60–90s | Startup/liveness/readiness probes hitting port 8080 — health is on **8081** | Set all probes to port `8081` |
+| `AccessDeniedException: /app/storage` | Container runs as random UID with no write access to `/app/storage` | Set storage `base-path` to `/tmp/kestra-storage` |
+| `nc` not found in init container | `ubi8/ubi-minimal` does not include netcat | Use bash's built-in `/dev/tcp` test instead |
+| Rolling update deadlocked | Old pod never becomes Ready so Kubernetes won't terminate it | Force-delete the old pod to unblock the rollout |
 
 ---
 
 ## 🤖 Automated Deployment (Ansible)
 
-The included `deploy-kestra.yml` playbook handles the full lifecycle including PVC provisioning.
+The included `deploy-kestra.yml` playbook automates the entire deployment. See [deploy-kestra.yml](deploy-kestra.yml) for details.
 
 ```bash
 # Install dependencies (one-time)
 ansible-galaxy collection install kubernetes.core
 pip install kubernetes openshift
 
-# Deploy — namespace autodetected from current oc project
-ansible-playbook deploy-kestra.yml -e kestra_db_password=k3str4
-
-# Deploy to a specific namespace
-ansible-playbook deploy-kestra.yml -e kestra_ns=ryan-nix-dev -e kestra_db_password=k3str4
-
-# Uninstall — removes all resources but KEEPS PVCs and data
-ansible-playbook deploy-kestra.yml -e kestra_action=uninstall
-
-# Destroy — removes everything including PVCs (DATA WILL BE LOST)
-ansible-playbook deploy-kestra.yml -e kestra_action=destroy
+# Deploy
+ansible-playbook deploy-kestra.yml \
+  -e namespace=ryan-nix-dev \
+  -e kestra_db_password=k3str4
 ```
 
 ---
@@ -75,45 +90,9 @@ helm repo add kestra https://helm.kestra.io/
 helm repo update
 ```
 
-### 2. Create PVCs
+### 2. Deploy PostgreSQL 16
 
-Two PVCs are required for persistence. Without them, all data is lost on pod restart.
-
-```bash
-# PostgreSQL data — survives DB pod restarts
-cat <<EOF | oc apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: kestra-pg-data
-  namespace: <your-namespace>
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi
-EOF
-
-# Kestra storage — flows, execution outputs, task files
-cat <<EOF | oc apply -f -
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: kestra-storage
-  namespace: <your-namespace>
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
-EOF
-```
-
-### 3. Deploy PostgreSQL 16
-
-The Kestra Helm chart's Flyway migrations require **PostgreSQL 13+**. The `oc new-app postgresql-persistent` template deploys PostgreSQL 10, which fails. Use the Red Hat PostgreSQL 16 image and attach the PVC:
+The Kestra Helm chart's Flyway migrations require **PostgreSQL 13 or newer**. The `oc new-app postgresql-persistent` template deploys PostgreSQL 10, which will fail. The newest Red Hat-supported container image is PostgreSQL 16:
 
 ```bash
 oc new-app registry.redhat.io/rhel9/postgresql-16:latest \
@@ -123,23 +102,13 @@ oc new-app registry.redhat.io/rhel9/postgresql-16:latest \
   --name=kestra-postgresql \
   -n <your-namespace>
 
-# Attach the PVC
-oc set volume deployment/kestra-postgresql \
-  --add \
-  --name=kestra-pg-data \
-  --type=persistentVolumeClaim \
-  --claim-name=kestra-pg-data \
-  --mount-path=/var/lib/pgsql/data \
-  --overwrite \
-  -n <your-namespace>
-
 # Wait for it to be ready
 oc rollout status deployment/kestra-postgresql -n <your-namespace>
 ```
 
-### 4. Create `values-openshift.yaml`
+### 3. Create `values-openshift.yaml`
 
-The Kestra Helm chart underwent **breaking changes in v1.0.0**. See the [migration reference](#-helm-v10-key-migration-reference) below if upgrading from an older values file.
+The Kestra Helm chart underwent **breaking changes in v1.0.0**. The old top-level keys (`configuration`, `securityContext`, `resources`, `livenessProbe`, etc.) no longer exist. Everything now lives under `configurations.application` and `common`.
 
 ```yaml
 # ─── Application Configuration ─────────────────────────────────────────────────
@@ -159,7 +128,8 @@ configurations:
       storage:
         type: local
         local:
-          base-path: "/app/kestra-storage"   # PVC-backed mount path
+          # /tmp is always writable by any UID assigned by OpenShift
+          base-path: "/tmp/kestra-storage"
 
 # ─── Common (applies to all Kestra components) ─────────────────────────────────
 common:
@@ -203,7 +173,7 @@ common:
     timeoutSeconds: 5
     failureThreshold: 5
 
-  # Reuse the Kestra image — no extra registry pull needed
+  # Reuse the Kestra image already on the node — no extra registry dependency
   # Uses bash /dev/tcp since ubi-minimal does not include netcat
   initContainers:
     - name: wait-for-postgres
@@ -218,16 +188,6 @@ common:
           done
           echo "PostgreSQL is ready!"
 
-  # Mount the Kestra storage PVC
-  extraVolumes:
-    - name: kestra-storage
-      persistentVolumeClaim:
-        claimName: kestra-storage
-
-  extraVolumeMounts:
-    - name: kestra-storage
-      mountPath: /app/kestra-storage
-
 # ─── Disable built-in dependencies ────────────────────────────────────────────
 postgresql:
   enabled: false
@@ -235,11 +195,12 @@ postgresql:
 dind:
   enabled: false
 
+# ─── Expose via oc expose after deploy (see Step 5) ───────────────────────────
 ingress:
   enabled: false
 ```
 
-### 5. Install Kestra
+### 4. Install Kestra
 
 ```bash
 helm install kestra kestra/kestra \
@@ -247,25 +208,41 @@ helm install kestra kestra/kestra \
   -f values-openshift.yaml
 ```
 
-Watch the pods — expected progression:
+Watch the pods:
+
+```bash
+oc get pods -n <your-namespace> -w
+```
+
+Expected progression:
 
 ```
 Init:0/1  →  PodInitializing  →  Running (0/1)  →  Running (1/1)
 ```
 
-The JVM startup + 1013 plugin scan takes approximately 90 seconds.
+The JVM startup + 1013 plugin scan takes approximately 90 seconds. The `0/1 Running` state is normal during this window.
 
-### 6. Expose via OpenShift Route
+### 5. Expose via OpenShift Route
 
 ```bash
+# Find the service name (typically just 'kestra')
+oc get svc -n <your-namespace> | grep kestra
+
+# Expose it
 oc expose svc/kestra --port=8080 --name=kestra-route -n <your-namespace>
 
+# Add TLS edge termination
 oc patch route kestra-route -n <your-namespace> \
   --type=merge \
   -p '{"spec":{"tls":{"termination":"edge","insecureEdgeTerminationPolicy":"Redirect"}}}'
 
+# Get your URL
 oc get route kestra-route -n <your-namespace> -o jsonpath='{.spec.host}'
 ```
+
+### 6. Access the UI
+
+Open the route URL in your browser. On first launch, Kestra presents a setup wizard to create an admin user.
 
 ---
 
@@ -281,7 +258,7 @@ helm upgrade kestra kestra/kestra \
 oc rollout status deployment/kestra-standalone -n <your-namespace>
 ```
 
-If the rolling update deadlocks (new pod initializing, old pod stuck `0/1`):
+If the rolling update deadlocks (new pod initializing, old pod stuck `0/1`), force it:
 
 ```bash
 oc delete pod $(oc get pod -l app.kubernetes.io/component=standalone \
@@ -294,14 +271,17 @@ oc delete pod $(oc get pod -l app.kubernetes.io/component=standalone \
 ## 🧹 Uninstalling
 
 ```bash
-# Remove Helm release and PostgreSQL — PVCs are retained
 helm uninstall kestra -n <your-namespace>
-oc delete deployment/kestra-postgresql svc/kestra-postgresql -n <your-namespace>
-oc delete route kestra-route -n <your-namespace>
 
-# Full teardown including data (irreversible)
-oc delete pvc kestra-storage kestra-pg-data -n <your-namespace>
+oc delete deployment/kestra-postgresql \
+   svc/kestra-postgresql \
+   -n <your-namespace>
+
+oc delete pvc --all -n <your-namespace>
+oc delete route kestra-route -n <your-namespace>
 ```
+
+> ⚠️ Deleting PVCs removes all persisted flow and execution data.
 
 ---
 
@@ -315,18 +295,19 @@ OpenShift Route (HTTPS/edge TLS)
   port 8080 (UI/API)  ──► kestra-standalone pod
   port 8081 (health)       │
                            ├── init: wait-for-postgres (/dev/tcp)
-                           ├── PVC: kestra-storage → /app/kestra-storage (10Gi)
+                           ├── storage: /tmp/kestra-storage
                            └── DB: jdbc:postgresql://kestra-postgresql:5432/kestra
                                         │
                                         ▼
                            Deployment: kestra-postgresql
                            (registry.redhat.io/rhel9/postgresql-16)
-                           PVC: kestra-pg-data → /var/lib/pgsql/data (5Gi)
 ```
 
 ---
 
 ## 📋 Helm v1.0 Key Migration Reference
+
+If you have an old `values-openshift.yaml` using the pre-1.0 schema:
 
 | Old Key (v0.x) | New Key (v1.0+) |
 |---|---|
@@ -337,7 +318,7 @@ OpenShift Route (HTTPS/edge TLS)
 | `readinessProbe:` | `common.readinessProbe:` |
 | `initContainers:` | `common.initContainers:` |
 
-The chart's `checks.yaml` hard-blocks installation with `configuration is not authorized anymore` if any old top-level keys are present.
+The chart's `checks.yaml` will hard-block installation with `configuration is not authorized anymore` if any old top-level keys are present.
 
 ---
 
